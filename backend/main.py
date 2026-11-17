@@ -12,6 +12,10 @@ from azure.search.documents.indexes.models import (
     SearchField,
     SearchFieldDataType,
     SearchIndex,
+    SemanticConfiguration,
+    SemanticField,
+    SemanticPrioritizedFields,
+    SemanticSearch,
     SimpleField,
     VectorSearch,
     VectorSearchProfile,
@@ -48,9 +52,24 @@ index_client = SearchIndexClient(SEARCH_ENDPOINT, cred)
 search_client = SearchClient(SEARCH_ENDPOINT, INDEX_NAME, cred)
 
 
+SEMANTIC_CONFIG = "default-semantic"
+semantic_search = SemanticSearch(
+    configurations=[
+        SemanticConfiguration(
+            name=SEMANTIC_CONFIG,
+            prioritized_fields=SemanticPrioritizedFields(content_fields=[SemanticField(field_name="content")]),
+        )
+    ]
+)
+
+
 def ensure_index():
-    """Create the search index (text + vector fields) if it doesn't exist."""
+    """Create the search index (text + vector + semantic config) or add the semantic config to an old index."""
     if INDEX_NAME in [n for n in index_client.list_index_names()]:
+        existing = index_client.get_index(INDEX_NAME)
+        if not existing.semantic_search or not existing.semantic_search.configurations:
+            existing.semantic_search = semantic_search  # needed for reranking; keeps your data
+            index_client.create_or_update_index(existing)
         return
     index = SearchIndex(
         name=INDEX_NAME,
@@ -71,6 +90,7 @@ def ensure_index():
             algorithms=[HnswAlgorithmConfiguration(name="hnsw")],
             profiles=[VectorSearchProfile(name="vec-profile", algorithm_configuration_name="hnsw")],
         ),
+        semantic_search=semantic_search,
     )
     index_client.create_index(index)
 
@@ -180,16 +200,55 @@ SYSTEM = (
 )
 
 
+REWRITE_PROMPT = (
+    "Rewrite the user's latest question as a single standalone search query. "
+    "Use the chat history to resolve pronouns and references (e.g. 'it', 'that', 'the second one'), "
+    "and add useful keywords. Do not answer. Output ONLY the rewritten query."
+)
+
+
+def rewrite_query(question: str, history: list[dict]) -> str:
+    """QUERY REWRITING: same chat LLM turns a follow-up like 'what about its price?' into a standalone query."""
+    try:
+        convo = "\n".join(f"{m['role']}: {m['content']}" for m in history[-6:])
+        r = aoai.chat.completions.create(
+            model=CHAT_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": REWRITE_PROMPT},
+                {"role": "user", "content": f"Chat history:\n{convo or '(none)'}\n\nLatest question: {question}"},
+            ],
+        )
+        return (r.choices[0].message.content or "").strip() or question
+    except Exception:
+        return question  # never block the chat because rewriting failed
+
+
+def retrieve(query: str, k: int = 5):
+    """Hybrid search (keyword + vector) -> Azure semantic RERANKER -> top k. Falls back to plain hybrid."""
+    qv = embed([query])[0]
+    common = dict(
+        search_text=query,  # keyword (BM25)
+        vector_queries=[VectorizedQuery(vector=qv, k_nearest_neighbors=30, fields="embedding")],  # vector
+        select=["content", "filename"],
+    )
+    try:
+        # fetch 30 candidates, the semantic ranker re-scores them, keep the best k
+        results = search_client.search(
+            **common, query_type="semantic", semantic_configuration_name=SEMANTIC_CONFIG, top=k
+        )
+        return [
+            {"content": r["content"], "filename": r["filename"], "score": r.get("@search.reranker_score")}
+            for r in results
+        ]
+    except Exception:
+        results = search_client.search(**common, top=k)
+        return [{"content": r["content"], "filename": r["filename"], "score": None} for r in results]
+
+
 @app.post("/chat")
 def chat(req: ChatRequest):
-    qv = embed([req.question])[0]
-    results = search_client.search(
-        search_text=req.question,  # keyword (BM25)
-        vector_queries=[VectorizedQuery(vector=qv, k_nearest_neighbors=5, fields="embedding")],  # vector
-        select=["content", "filename"],
-        top=5,
-    )
-    hits = [{"content": r["content"], "filename": r["filename"]} for r in results]
+    query = rewrite_query(req.question, req.history)
+    hits = retrieve(query)
     context = "\n\n".join(f"[{h['filename']}]\n{h['content']}" for h in hits)
 
     messages = [{"role": "system", "content": SYSTEM}]
@@ -198,7 +257,7 @@ def chat(req: ChatRequest):
 
     def stream():
         sources = sorted({h["filename"] for h in hits})
-        yield f"data: {json.dumps({'sources': sources})}\n\n"
+        yield f"data: {json.dumps({'sources': sources, 'query': query})}\n\n"
         try:
             for ev in aoai.chat.completions.create(
                 model=CHAT_DEPLOYMENT, messages=messages, stream=True  # gpt-5 models only allow default temperature

@@ -63,7 +63,7 @@ export default function App() {
           const data = p.replace(/^data: /, "");
           if (data === "[DONE]") continue;
           const ev = JSON.parse(data);
-          if (ev.sources) patch((x) => ({ ...x, sources: ev.sources }));
+          if (ev.sources) patch((x) => ({ ...x, sources: ev.sources, query: ev.query }));
           if (ev.token) patch((x) => ({ ...x, content: x.content + ev.token }));
           if (ev.error) patch((x) => ({ ...x, content: x.content + "\n[error] " + ev.error }));
         }
@@ -97,6 +97,7 @@ export default function App() {
             <div key={i} className={"msg " + m.role}>
               <div className="bubble">{m.content || (busy ? "..." : "")}</div>
               {m.sources?.length > 0 && <div className="src">Sources: {m.sources.join(", ")}</div>}
+              {m.query && <div className="src">Searched for: {m.query}</div>}
             </div>
           ))}
           <div ref={endRef} />
