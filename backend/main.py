@@ -31,6 +31,27 @@ from pydantic import BaseModel
 
 load_dotenv()
 
+# ---------- chat log file (one JSON line per question, no database) ----------
+import logging
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+chat_logger = logging.getLogger("chat_log")
+chat_logger.setLevel(logging.INFO)
+chat_logger.propagate = False
+if not chat_logger.handlers:
+    _h = RotatingFileHandler(LOG_DIR / "chat.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    _h.setFormatter(logging.Formatter("%(message)s"))
+    chat_logger.addHandler(_h)
+
+
+def log_chat(**fields):
+    fields = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"), **fields}
+    chat_logger.info(json.dumps(fields, ensure_ascii=False))
+
 # ---------- config ----------
 OPENAI_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"]
 OPENAI_KEY = os.environ["AZURE_OPENAI_API_KEY"]
@@ -258,14 +279,25 @@ def chat(req: ChatRequest):
     def stream():
         sources = sorted({h["filename"] for h in hits})
         yield f"data: {json.dumps({'sources': sources, 'query': query})}\n\n"
+        answer, error = [], None
         try:
             for ev in aoai.chat.completions.create(
                 model=CHAT_DEPLOYMENT, messages=messages, stream=True  # gpt-5 models only allow default temperature
             ):
                 if ev.choices and ev.choices[0].delta.content:
+                    answer.append(ev.choices[0].delta.content)
                     yield f"data: {json.dumps({'token': ev.choices[0].delta.content})}\n\n"
         except Exception as e:  # surface errors to the UI
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            error = str(e)
+            yield f"data: {json.dumps({'error': error})}\n\n"
+        finally:  # also runs if the client disconnects mid-stream
+            log_chat(
+                question=req.question,
+                rewritten_query=query,
+                answer="".join(answer),
+                sources=sources,
+                error=error,
+            )
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
