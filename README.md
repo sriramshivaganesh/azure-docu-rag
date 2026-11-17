@@ -109,5 +109,17 @@ Open http://localhost:5173 → **Upload file** (pdf / docx / txt / md / csv) →
 - Free Search tier is 50 MB total – delete the index if you hit the limit.
 - To avoid charges after experimenting: delete the resource group `rg-doc-rag`.
 
-## 5. Notes / next steps
+## 5. LangChain usage (backend/main.py)
+| Step | LangChain piece |
+|---|---|
+| Read files | `PyPDFLoader`, `Docx2txtLoader`, `TextLoader` |
+| Chunking | `RecursiveCharacterTextSplitter` (1000 / 150 overlap) |
+| Embeddings | `AzureOpenAIEmbeddings` |
+| Chat + rewrite LLM | `AzureChatOpenAI` |
+| Retrieval | custom `AzureHybridRetriever(BaseRetriever)` (hybrid + semantic reranker) |
+| Query rewriting / answering | `prompt \| llm \| StrOutputParser` chains (`rewrite_chain`, `answer_chain`), streamed with `.stream()` |
+
+Index creation, Blob upload and delete stay on the Azure SDKs.
+
+## 6. Notes / next steps
 Keys are used for simplicity; for production use Managed Identity + Key Vault, add auth to the API, and consider Azure AI Search semantic ranking.
